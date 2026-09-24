@@ -344,3 +344,134 @@ def aim_solutions(
             continue
         deduped.append(sol)
     return deduped
+
+
+def _rotate(
+    v: tuple[float, float], angle_deg: float
+) -> tuple[float, float]:
+    """将向量绕原点逆时针旋转 angle_deg 度（负值为顺时针）。"""
+    theta = math.radians(angle_deg)
+    c, s = math.cos(theta), math.sin(theta)
+    return (c * v[0] - s * v[1], s * v[0] + c * v[1])
+
+
+def alignment_sensitivities(
+    start: tuple[float, float],
+    direction: tuple[float, float],
+    n_start: float,
+    interfaces: list[tuple[tuple[float, float], tuple[float, float], float]],
+    obs_point: tuple[float, float],
+    obs_normal: tuple[float, float],
+    perturb_angle_deg: float,
+) -> dict:
+    """对每个界面求观察线有符号偏移对其法线角度的中心差分灵敏度。
+
+    观察线单位切向量 t 为其法线归一化后逆时针旋转 90°；偏移量为基准出射线
+    与观察线前向交点相对观察线给定点沿 t 的有符号距离。
+
+    流程：先追迹基准光线得到基准偏移；再依次对每个界面，仅将其法线旋转
+    ±perturb_angle_deg（界面点、折射率及其他界面参数不变）重新追迹，以
+    中心差分 (offset(+a) - offset(-a)) / (2a) 给出导数（长度/度）。
+    基准或任一扰动发生全反射、漏过界面或无法前向命中观察线时，该次结果的
+    offset 为 None 并返回其 status；基准失效或某界面任一扰动分支失效时，
+    该界面导数为 None，不跨失效分支求差分。
+    """
+    nrm = normalize(obs_normal)
+    tangent = (-nrm[1], nrm[0])  # 法线逆时针旋转 90° 得单位切向量
+
+    def run(
+        ifs: list[tuple[tuple[float, float], tuple[float, float], float]],
+    ) -> tuple[str, str | None, float | None, tuple[float, float] | None]:
+        """追迹一次并求观察线前向交点偏移。
+
+        返回 (status, reason, offset, observation_point)；追迹未完成或无
+        前向交点时 offset 为 None，status 反映实际停止/失效原因。
+        """
+        segments, status, reason = trace_ray(start, direction, n_start, ifs)
+        if status != "completed":
+            return status, reason, None, None
+        point = observation_intersection(segments, obs_point, obs_normal)
+        if point is None:
+            return (
+                "no_observation_intersection",
+                "出射线与观察线平行，或交点位于出射线反方向",
+                None,
+                None,
+            )
+        offset = _dot(
+            (point[0] - obs_point[0], point[1] - obs_point[1]), tangent
+        )
+        return "completed", None, offset, point
+
+    base_status, base_reason, base_offset, base_point = run(interfaces)
+
+    results: list[dict] = []
+    for idx, (point, normal, n_next) in enumerate(interfaces):
+        perturbed = list(interfaces)
+        rotated_plus = _rotate(normal, perturb_angle_deg)
+        rotated_minus = _rotate(normal, -perturb_angle_deg)
+
+        perturbed[idx] = (point, rotated_plus, n_next)
+        p_status, p_reason, p_offset, p_point = run(perturbed)
+
+        perturbed[idx] = (point, rotated_minus, n_next)
+        m_status, m_reason, m_offset, m_point = run(perturbed)
+
+        derivative: float | None = None
+        if (
+            base_offset is not None
+            and p_offset is not None
+            and m_offset is not None
+        ):
+            derivative = (p_offset - m_offset) / (2.0 * perturb_angle_deg)
+
+        results.append(
+            {
+                "interface_index": idx,
+                "perturb_angle_deg": perturb_angle_deg,
+                "plus": {
+                    "normal": {
+                        "x": rotated_plus[0],
+                        "y": rotated_plus[1],
+                    },
+                    "status": p_status,
+                    "reason": p_reason,
+                    "observation_point": (
+                        None
+                        if p_point is None
+                        else {"x": p_point[0], "y": p_point[1]}
+                    ),
+                    "offset": p_offset,
+                },
+                "minus": {
+                    "normal": {
+                        "x": rotated_minus[0],
+                        "y": rotated_minus[1],
+                    },
+                    "status": m_status,
+                    "reason": m_reason,
+                    "observation_point": (
+                        None
+                        if m_point is None
+                        else {"x": m_point[0], "y": m_point[1]}
+                    ),
+                    "offset": m_offset,
+                },
+                "derivative": derivative,
+            }
+        )
+
+    return {
+        "tangent": tangent,
+        "baseline": {
+            "status": base_status,
+            "reason": base_reason,
+            "observation_point": (
+                None
+                if base_point is None
+                else {"x": base_point[0], "y": base_point[1]}
+            ),
+            "offset": base_offset,
+        },
+        "interface_sensitivities": results,
+    }

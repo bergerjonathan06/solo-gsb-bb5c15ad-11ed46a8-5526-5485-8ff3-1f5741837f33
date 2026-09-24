@@ -11,6 +11,10 @@ POST /api/power-evaluations           复用光束采样与追迹，按菲涅耳
 POST /api/aim-solutions               在半角范围内扫描发射角并对偏差异号区间二分，
                                       求解命中观察线目标偏移量的光线，返回角度、
                                       出射方向、观察线交点与目标偏差（不入库）
+POST /api/alignment-sensitivities     对单光线的每个界面只将其法线旋转 ±扰动角，
+                                      按中心差分给出观察线偏移对法线角度的导数
+                                      （长度/度），返回基准偏移与各界面两次扰动
+                                      结果及导数（不入库）
 """
 from __future__ import annotations
 
@@ -21,6 +25,7 @@ from fastapi import FastAPI, HTTPException
 from . import db
 from .geometry import (
     aim_solutions,
+    alignment_sensitivities,
     centroid_and_rms,
     observation_intersection,
     ray_transmittance,
@@ -31,6 +36,8 @@ from .geometry import (
 from .schemas import (
     AimRequest,
     AimSolutionOut,
+    AlignmentRequest,
+    AlignmentSensitivityOut,
     BeamEvaluationOut,
     BeamRequest,
     PowerEvaluationOut,
@@ -267,3 +274,31 @@ def compute_aim_solutions(req: AimRequest) -> list[dict]:
         }
         for angle, exit_dir, point, deviation in solutions
     ]
+
+
+@app.post("/api/alignment-sensitivities", response_model=AlignmentSensitivityOut)
+def compute_alignment_sensitivities(req: AlignmentRequest) -> dict:
+    """单光线观察线偏移对各界面法线角度的中心差分灵敏度（不入库）。
+
+    以观察线法线归一化后逆时针旋转 90° 得单位切向量，先追迹基准光线，求
+    出射线与观察线的前向交点相对观察线给定点沿切向量的有符号偏移；再对
+    每个界面只将其法线旋转 ±perturb_angle_deg（界面点、折射率及其他界面
+    参数不变）重新追迹，按 (offset(+a) - offset(-a)) / (2a) 给出偏移量对
+    法线角度的导数（长度/度）。基准或任一扰动发生全反射、漏过界面或无法
+    前向命中观察线时，对应结果的 offset 为 null 并返回其 status；基准失效
+    或某界面任一扰动分支失效时该界面导数为 null，不跨失效分支求差分。
+    """
+    interfaces = [
+        (itf.point.as_tuple(), itf.normal.as_tuple(), itf.n_next)
+        for itf in req.interfaces
+    ]
+    result = alignment_sensitivities(
+        req.start.as_tuple(),
+        req.direction.as_tuple(),
+        req.n_start,
+        interfaces,
+        req.observation_line.point.as_tuple(),
+        req.observation_line.normal.as_tuple(),
+        req.perturb_angle_deg,
+    )
+    return {"perturb_angle_deg": req.perturb_angle_deg, **result}

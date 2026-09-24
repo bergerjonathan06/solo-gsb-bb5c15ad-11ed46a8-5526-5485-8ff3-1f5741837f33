@@ -32,6 +32,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/beam-evaluations` | 扇形采样多条光线逐条追迹，返回各光线发射角、状态、观察线交点及质心/RMS（不入库） |
 | POST | `/api/power-evaluations` | 复用光束采样与追迹，按菲涅耳公式逐界面累乘 s/p 透过率，返回各光线功率与功率加权质心（不入库） |
 | POST | `/api/aim-solutions` | 扫描发射角并对偏差异号区间二分，求解命中观察线目标偏移量的光线（不入库） |
+| POST | `/api/alignment-sensitivities` | 单光线逐界面将法线旋转 ±扰动角，按中心差分给出观察线偏移对法线角度的导数（长度/度，不入库） |
 
 ### 请求示例
 
@@ -262,12 +263,89 @@ curl -X POST http://localhost:8000/api/aim-solutions \
 
 服务地址：API 根路径 http://localhost:8000 ，交互式文档（可在线试调该接口）http://localhost:8000/docs 。
 
+## 装调灵敏度
+
+`POST /api/alignment-sensitivities` 接收**单条光线**（起点、方向、起始折射率）、按顺序排列的界面、观察线，以及正值扰动角 `perturb_angle_deg`（度），评估出射线在观察线上的位置对**每个界面法线角度**的灵敏度。该接口为即时计算，结果不写入数据库。
+
+- 观察线法线归一化后**逆时针旋转 90°** 得单位切向量 `t`；**有符号偏移** = 基准出射线与观察线的前向交点相对观察线给定点沿 `t` 的有符号距离。
+- 先追迹**基准**光线得到基准偏移；再对每个界面只将其法线分别旋转 `+perturb_angle_deg` 与 `-perturb_angle_deg`（**界面点、折射率及其他界面参数保持不变**）重新追迹，按中心差分给出导数：
+
+  ```
+  derivative = (offset(+a) - offset(-a)) / (2a)      # 单位：长度 / 度
+  ```
+
+- 基准或任一侧扰动发生**全反射**、**漏过界面**（与界面平行 / 交点在反方向）或**无法前向命中观察线**时，该次的 `offset` 与 `observation_point` 为 `null`，并返回其 `status`（`total_internal_reflection` / `no_intersection` / `no_observation_intersection`）与 `reason`。
+- **不跨失效分支求差分**：基准失效，或某界面 `+a` / `-a` 任一分支失效时，该界面的 `derivative` 为 `null`；两次扰动结果与状态仍分别返回。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/alignment-sensitivities` | 基准追迹 + 逐界面 ±角度扰动，返回基准偏移与各界面两次扰动结果及中心差分导数（不入库） |
+
+### 装调灵敏度请求示例
+
+```bash
+curl -X POST http://localhost:8000/api/alignment-sensitivities \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start": {"x": 0, "y": 0},
+    "direction": {"x": 1, "y": 0},
+    "n_start": 1.0,
+    "interfaces": [
+      {"point": {"x": 2, "y": 0}, "normal": {"x": 1, "y": 0}, "n_next": 1.5},
+      {"point": {"x": 4, "y": 0}, "normal": {"x": 1, "y": 0}, "n_next": 1.0}
+    ],
+    "observation_line": {"point": {"x": 10, "y": 0}, "normal": {"x": 1, "y": 0}},
+    "perturb_angle_deg": 0.5
+  }'
+```
+
+### 装调灵敏度响应说明
+
+```json
+{
+  "perturb_angle_deg": 0.5,
+  "tangent": {"x": -0.0, "y": 1.0},
+  "baseline": {
+    "status": "completed",
+    "reason": null,
+    "observation_point": {"x": 10.0, "y": 0.0},
+    "offset": 0.0
+  },
+  "interface_sensitivities": [
+    {
+      "interface_index": 0,
+      "perturb_angle_deg": 0.5,
+      "plus": {
+        "normal": {"x": 0.9999619230641713, "y": 0.008726535498373935},
+        "status": "completed",
+        "reason": null,
+        "observation_point": {"x": 10.0, "y": 0.03199838292636644},
+        "offset": 0.03199838292636644
+      },
+      "minus": {
+        "normal": {"x": 0.9999619230641713, "y": -0.008726535498373935},
+        "status": "completed",
+        "reason": null,
+        "observation_point": {"x": 10.0, "y": -0.03199838292636644},
+        "offset": -0.03199838292636644
+      },
+      "derivative": 0.06399676585273288
+    }
+  ]
+}
+```
+
+- `tangent`：观察线单位切向量（法线逆时针旋转 90°），偏移量的正方向。
+- `baseline`：基准追迹的状态、观察线前向交点与有符号偏移；基准无法命中时 `offset` 为 `null`。
+- `interface_sensitivities[]` 与请求中界面顺序一一对应：`plus` / `minus` 分别为法线 `+a` / `-a` 扰动后实际使用的法线、追迹状态、观察线交点与偏移；`derivative` 为中心差分导数（长度/度），基准或任一扰动分支失效时为 `null`。
+- 无界面时 `interface_sensitivities` 为空列表，仅返回基准追迹结果。
+
 ## 项目结构
 
 ```
 app/
   main.py       FastAPI 路由与生命周期（启动时建库）
-  geometry.py   二维求交、斯涅尔折射、方向采样、光斑质心/RMS、菲涅耳 s/p 透过率与功率加权质心、瞄准求解（扫描+二分）
+  geometry.py   二维求交、斯涅尔折射、方向采样、光斑质心/RMS、菲涅耳 s/p 透过率与功率加权质心、瞄准求解（扫描+二分）、装调灵敏度（法线 ±角度扰动中心差分）
   db.py         SQLite 持久化（traces / segments 两表）
   schemas.py    Pydantic 请求 / 响应模型
 Dockerfile

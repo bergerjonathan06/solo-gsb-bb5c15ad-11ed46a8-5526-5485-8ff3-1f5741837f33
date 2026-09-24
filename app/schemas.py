@@ -172,3 +172,63 @@ class AimSolutionOut(BaseModel):
     exit_direction: Vec2
     observation_point: Vec2
     target_deviation: float
+
+
+class AlignmentRequest(BaseModel):
+    """装调灵敏度请求：单光线逐界面追迹，评估观察线偏移对各界面法线角度的导数。
+
+    perturb_angle_deg 为中心差分的正值扰动角（度）：对每个界面只将其法线
+    分别旋转 ±perturb_angle_deg，界面点、折射率与其他界面参数保持不变。
+    """
+
+    start: Vec2
+    direction: Vec2
+    n_start: float = Field(gt=0, description="起始介质折射率，必须为正")
+    interfaces: list[InterfaceIn] = Field(default_factory=list)
+    observation_line: ObservationLineIn
+    perturb_angle_deg: float = Field(
+        gt=0, description="法线扰动角（度），必须为正；每个界面取 ±该角度"
+    )
+
+    @field_validator("direction")
+    @classmethod
+    def direction_nonzero(cls, v: Vec2) -> Vec2:
+        if math.hypot(v.x, v.y) < _EPS:
+            raise ValueError("方向不能为零向量")
+        return v
+
+
+class AlignmentPerturbOut(BaseModel):
+    """单侧法线扰动的追迹结果；失效时 observation_point / offset 为 null。"""
+
+    normal: Vec2
+    status: str
+    reason: str | None
+    observation_point: Vec2 | None
+    offset: float | None
+
+
+class InterfaceSensitivityOut(BaseModel):
+    """单个界面的 ±扰动结果与偏移对法线角度的中心差分导数（长度/度）。"""
+
+    interface_index: int
+    perturb_angle_deg: float
+    plus: AlignmentPerturbOut
+    minus: AlignmentPerturbOut
+    derivative: float | None
+
+
+class AlignmentBaselineOut(BaseModel):
+    """基准（不扰动）追迹的观察线偏移；无法命中时 offset 为 null。"""
+
+    status: str
+    reason: str | None
+    observation_point: Vec2 | None
+    offset: float | None
+
+
+class AlignmentSensitivityOut(BaseModel):
+    perturb_angle_deg: float
+    tangent: Vec2
+    baseline: AlignmentBaselineOut
+    interface_sensitivities: list[InterfaceSensitivityOut]
