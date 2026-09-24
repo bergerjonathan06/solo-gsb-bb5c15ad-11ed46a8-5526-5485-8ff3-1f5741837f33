@@ -246,6 +246,94 @@ def trace_ray(
     return segments, "completed", None
 
 
+def _rotate_normal(
+    normal: tuple[float, float], angle_deg: float
+) -> tuple[float, float]:
+    """将单位法线绕原点旋转 angle_deg 度（逆时针为正）。"""
+    theta = math.radians(angle_deg)
+    c, s = math.cos(theta), math.sin(theta)
+    return (c * normal[0] - s * normal[1], s * normal[0] + c * normal[1])
+
+
+def alignment_sensitivities(
+    start: tuple[float, float],
+    direction: tuple[float, float],
+    n_start: float,
+    interfaces: list[tuple[tuple[float, float], tuple[float, float], float]],
+    obs_point: tuple[float, float],
+    obs_normal: tuple[float, float],
+    perturbation_deg: float,
+) -> dict:
+    """基准追迹 + 逐界面法线 ±扰动，按中心差分求观察线偏移对法线角度的导数。
+
+    观察线法线归一化后逆时针旋转 90° 得单位切向量 t；偏移量 = 出射段与观察线
+    前向交点相对 obs_point 沿 t 的有符号距离。
+
+    对每个界面只将其法线旋转 ±perturbation_deg（界面点与其他参数不变）后重新
+    追迹，导数 = (s(+δ) - s(-δ)) / (2δ)，单位为长度/度。基准或任一扰动发生
+    全反射、漏过界面或无法前向命中观察线时，该次偏移为 None、对应导数为 None，
+    不跨失效分支求差分。该函数为即时计算，不写入数据库。
+
+    返回 dict：
+      tangent: 观察线单位切向量；
+      baseline: (status, reason, point|None, offset|None)；
+      interfaces: 每个界面 [plus, minus, derivative|None]，其中
+                  plus/minus = (status, reason, point|None, offset|None, perturbed_normal)。
+    """
+    nrm = normalize(obs_normal)
+    tangent = (-nrm[1], nrm[0])  # 法线逆时针旋转 90° 得单位切向量
+    normals = [normalize(normal) for _point, normal, _n in interfaces]
+
+    def run(
+        itf: list[tuple[tuple[float, float], tuple[float, float], float]],
+    ) -> tuple[str, str | None, tuple[float, float] | None, float | None]:
+        """追迹一次并求观察线偏移；全反射/漏过界面/无前向交点时偏移为 None。"""
+        segments, status, reason = trace_ray(start, direction, n_start, itf)
+        if status != "completed":
+            return status, reason, None, None
+        point = observation_intersection(segments, obs_point, obs_normal)
+        if point is None:
+            return (
+                "no_observation_intersection",
+                "出射段与观察线平行，或交点位于光线反方向",
+                None,
+                None,
+            )
+        offset = _dot((point[0] - obs_point[0], point[1] - obs_point[1]), tangent)
+        return "completed", None, point, offset
+
+    baseline = run(interfaces)
+
+    results: list[
+        tuple[
+            tuple[str, str | None, tuple[float, float] | None, float | None, tuple],
+            tuple[str, str | None, tuple[float, float] | None, float | None, tuple],
+            float | None,
+        ]
+    ] = []
+    for idx, ((point, _normal, n_next), base_nrm) in enumerate(
+        zip(interfaces, normals)
+    ):
+        plus_nrm = _rotate_normal(base_nrm, perturbation_deg)
+        minus_nrm = _rotate_normal(base_nrm, -perturbation_deg)
+        itf_plus = [
+            (pt, plus_nrm if i == idx else nm, nn)
+            for i, (pt, nm, nn) in enumerate(interfaces)
+        ]
+        itf_minus = [
+            (pt, minus_nrm if i == idx else nm, nn)
+            for i, (pt, nm, nn) in enumerate(interfaces)
+        ]
+        r_plus = run(itf_plus) + (plus_nrm,)
+        r_minus = run(itf_minus) + (minus_nrm,)
+        derivative: float | None = None
+        if r_plus[3] is not None and r_minus[3] is not None:
+            derivative = (r_plus[3] - r_minus[3]) / (2.0 * perturbation_deg)
+        results.append((r_plus, r_minus, derivative))
+
+    return {"tangent": tangent, "baseline": baseline, "interfaces": results}
+
+
 def aim_solutions(
     start: tuple[float, float],
     center_direction: tuple[float, float],

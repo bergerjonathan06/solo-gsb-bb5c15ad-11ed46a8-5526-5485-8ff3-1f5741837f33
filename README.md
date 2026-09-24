@@ -32,6 +32,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/beam-evaluations` | 扇形采样多条光线逐条追迹，返回各光线发射角、状态、观察线交点及质心/RMS（不入库） |
 | POST | `/api/power-evaluations` | 复用光束采样与追迹，按菲涅耳公式逐界面累乘 s/p 透过率，返回各光线功率与功率加权质心（不入库） |
 | POST | `/api/aim-solutions` | 扫描发射角并对偏差异号区间二分，求解命中观察线目标偏移量的光线（不入库） |
+| POST | `/api/alignment-sensitivities` | 基准追迹后逐界面将法线旋转 ±扰动角重新追迹，中心差分求观察线偏移对法线角度的导数（不入库） |
 
 ### 请求示例
 
@@ -260,6 +261,79 @@ curl -X POST http://localhost:8000/api/aim-solutions \
 - `observation_point`：出射段与观察线的前向交点。
 - `target_deviation`：该解的目标偏差，|值| ≤ 1e-6（因角度区间宽 ≤ 1e-7 度而停止时可能略超）。
 
+## 装调灵敏度（法线角度导数）
+
+`POST /api/alignment-sensitivities` 接收**单条光线**（起点、方向、起始折射率）、按顺序排列的界面、**观察线**（线上一点 + 法线）与**正值扰动角** `perturbation_angle_deg`（度，> 0），定量评估每个界面的装调角度误差对观察线命中位置的影响。该接口为即时计算，结果不写入数据库。
+
+- **切向量与基准偏移**：将观察线法线归一化后**逆时针旋转 90°** 得单位切向量 `t = (-ny, nx)`；先做一次基准追迹，取最终出射段与观察线的**前向**交点 `P`，基准偏移量 `offset = (P − 观察线给定点) · t`（沿 `t` 为正的有符号距离）。
+- **逐界面法线扰动**：对第 `i` 个界面，**只将其法线**分别旋转 `+δ` 与 `−δ`（`δ = perturbation_angle_deg`，逆时针为正；界面点、折射率与其他界面参数保持不变）后重新追迹，各得到一次偏移量。
+- **中心差分导数**：`derivative_per_deg = (offset(+δ) − offset(−δ)) / (2δ)`，单位为**长度/度**。
+- **失效处理（不跨失效分支求差分）**：基准或任一扰动追迹发生**全反射**（`total_internal_reflection`）、**漏过界面**（`no_intersection`，平行或交点在反方向），或出射段**无法前向命中观察线**（`no_observation_intersection`，平行或交点在光线反方向）时，该次 `offset` 与 `observation_point` 为 `null`、`reason` 给出原因；只要 `+δ`/`−δ` 任一侧失效，该界面的 `derivative_per_deg` 即为 `null`。注意：基准失效不会跳过扰动计算，每个界面仍返回两次扰动的完整状态，只是导数恒为 `null`。
+- 扰动结果中附 `perturbed_normal`（旋转后的单位法线）与 `perturbation_angle_deg`（`+δ` / `−δ`），便于核对。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/alignment-sensitivities` | 基准偏移 + 逐界面 ±法线扰动追迹，返回两次扰动结果与中心差分导数（长度/度，不入库） |
+
+### 装调灵敏度请求示例
+
+```bash
+curl -X POST http://localhost:8000/api/alignment-sensitivities \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start": {"x": 0, "y": 0},
+    "direction": {"x": 1, "y": 0},
+    "n_start": 1.0,
+    "interfaces": [
+      {"point": {"x": 2, "y": 0}, "normal": {"x": 1, "y": 0}, "n_next": 1.5},
+      {"point": {"x": 4, "y": 0}, "normal": {"x": 1, "y": 0}, "n_next": 1.0}
+    ],
+    "observation_line": {"point": {"x": 10, "y": 0}, "normal": {"x": 1, "y": 0}},
+    "perturbation_angle_deg": 0.1
+  }'
+```
+
+### 装调灵敏度响应说明
+
+```json
+{
+  "tangent": {"x": 0.0, "y": 1.0},
+  "perturbation_angle_deg": 0.1,
+  "baseline": {
+    "status": "completed",
+    "reason": null,
+    "observation_point": {"x": 10.0, "y": 0.0},
+    "offset": 0.0
+  },
+  "interfaces": [
+    {
+      "interface_index": 0,
+      "plus": {
+        "status": "completed",
+        "reason": null,
+        "observation_point": {"x": 10.0, "y": 0.00639954603029729},
+        "offset": 0.00639954603029729,
+        "perturbed_normal": {"x": 0.9999984769132877, "y": 0.0017453283658983088},
+        "perturbation_angle_deg": 0.1
+      },
+      "minus": {
+        "status": "completed",
+        "reason": null,
+        "observation_point": {"x": 10.0, "y": -0.00639954603029729},
+        "offset": -0.00639954603029729,
+        "perturbed_normal": {"x": 0.9999984769132877, "y": -0.0017453283658983088},
+        "perturbation_angle_deg": -0.1
+      },
+      "derivative_per_deg": 0.06399546030297289
+    }
+  ]
+}
+```
+
+- `tangent`：观察线单位切向量（法线逆时针旋转 90°）；`perturbation_angle_deg` 回显扰动角 δ。
+- `baseline`：基准追迹状态 `status`（`completed` / `total_internal_reflection` / `no_intersection` / `no_observation_intersection`）、停止原因 `reason`、观察线前向交点 `observation_point` 与基准有符号偏移 `offset`；失效时后两者为 `null`。
+- `interfaces[]` 与请求界面一一对应：`interface_index` 为序号，`plus` / `minus` 分别为法线旋转 `+δ` / `−δ` 后的追迹结果（字段同基准，另含扰动后的单位法线与实际扰动角）；`derivative_per_deg` 为中心差分导数（长度/度），任一侧或基准失效时为 `null`。
+
 服务地址：API 根路径 http://localhost:8000 ，交互式文档（可在线试调该接口）http://localhost:8000/docs 。
 
 ## 项目结构
@@ -267,7 +341,7 @@ curl -X POST http://localhost:8000/api/aim-solutions \
 ```
 app/
   main.py       FastAPI 路由与生命周期（启动时建库）
-  geometry.py   二维求交、斯涅尔折射、方向采样、光斑质心/RMS、菲涅耳 s/p 透过率与功率加权质心、瞄准求解（扫描+二分）
+  geometry.py   二维求交、斯涅尔折射、方向采样、光斑质心/RMS、菲涅耳 s/p 透过率与功率加权质心、瞄准求解（扫描+二分）、装调灵敏度（逐界面法线 ±扰动与中心差分）
   db.py         SQLite 持久化（traces / segments 两表）
   schemas.py    Pydantic 请求 / 响应模型
 Dockerfile

@@ -11,6 +11,8 @@ POST /api/power-evaluations           复用光束采样与追迹，按菲涅耳
 POST /api/aim-solutions               在半角范围内扫描发射角并对偏差异号区间二分，
                                       求解命中观察线目标偏移量的光线，返回角度、
                                       出射方向、观察线交点与目标偏差（不入库）
+POST /api/alignment-sensitivities     基准追迹后逐界面将法线旋转 ±扰动角重新追迹，
+                                      按中心差分求观察线偏移对法线角度的导数（不入库）
 """
 from __future__ import annotations
 
@@ -21,6 +23,7 @@ from fastapi import FastAPI, HTTPException
 from . import db
 from .geometry import (
     aim_solutions,
+    alignment_sensitivities,
     centroid_and_rms,
     observation_intersection,
     ray_transmittance,
@@ -31,11 +34,13 @@ from .geometry import (
 from .schemas import (
     AimRequest,
     AimSolutionOut,
+    AlignmentSensitivityOut,
     BeamEvaluationOut,
     BeamRequest,
     PowerEvaluationOut,
     PowerRequest,
     SegmentOut,
+    SensitivityRequest,
     TraceOut,
     TraceRequest,
     TraceSummary,
@@ -267,3 +272,68 @@ def compute_aim_solutions(req: AimRequest) -> list[dict]:
         }
         for angle, exit_dir, point, deviation in solutions
     ]
+
+
+def _sensitivity_run(run: tuple, normal: tuple[float, float] | None = None,
+                     angle: float | None = None) -> dict:
+    """将几何层一次追迹结果 (status, reason, point, offset[, nrm]) 转为响应字典。"""
+    status, reason, point, offset = run[:4]
+    out = {
+        "status": status,
+        "reason": reason,
+        "observation_point": (
+            None if point is None else {"x": point[0], "y": point[1]}
+        ),
+        "offset": offset,
+    }
+    if normal is not None:
+        out["perturbed_normal"] = {"x": normal[0], "y": normal[1]}
+        out["perturbation_angle_deg"] = angle
+    return out
+
+
+@app.post("/api/alignment-sensitivities", response_model=AlignmentSensitivityOut)
+def compute_alignment_sensitivities(req: SensitivityRequest) -> dict:
+    """基准追迹后逐界面扰动法线 ±δ，按中心差分求观察线偏移对法线角度的导数。
+
+    观察线法线归一化后逆时针旋转 90° 得单位切向量；先计算基准出射线前向交点
+    相对观察线给定点的有符号偏移。对每个界面只旋转其法线 ±perturbation_angle_deg
+    （界面点及其他参数不变）重新追迹，导数 = (偏移(+δ) - 偏移(-δ)) / (2δ)，
+    单位为长度/度。基准或任一扰动发生全反射、漏过界面或无法前向命中观察线时
+    （status 非 completed），该次偏移为 null、对应导数为 null，不跨失效分支
+    求差分。该接口为即时计算，不写入数据库。
+    """
+    interfaces = [
+        (itf.point.as_tuple(), itf.normal.as_tuple(), itf.n_next)
+        for itf in req.interfaces
+    ]
+    result = alignment_sensitivities(
+        req.start.as_tuple(),
+        req.direction.as_tuple(),
+        req.n_start,
+        interfaces,
+        req.observation_line.point.as_tuple(),
+        req.observation_line.normal.as_tuple(),
+        req.perturbation_angle_deg,
+    )
+    tangent = result["tangent"]
+    interfaces_out: list[dict] = []
+    for idx, (r_plus, r_minus, derivative) in enumerate(result["interfaces"]):
+        interfaces_out.append(
+            {
+                "interface_index": idx,
+                "plus": _sensitivity_run(
+                    r_plus, r_plus[4], req.perturbation_angle_deg
+                ),
+                "minus": _sensitivity_run(
+                    r_minus, r_minus[4], -req.perturbation_angle_deg
+                ),
+                "derivative_per_deg": derivative,
+            }
+        )
+    return {
+        "tangent": {"x": tangent[0], "y": tangent[1]},
+        "perturbation_angle_deg": req.perturbation_angle_deg,
+        "baseline": _sensitivity_run(result["baseline"]),
+        "interfaces": interfaces_out,
+    }

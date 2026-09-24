@@ -172,3 +172,55 @@ class AimSolutionOut(BaseModel):
     exit_direction: Vec2
     observation_point: Vec2
     target_deviation: float
+
+
+class SensitivityRequest(BaseModel):
+    """法线灵敏度请求：单条光线、顺序界面、观察线与正值扰动角（度）。"""
+
+    start: Vec2
+    direction: Vec2
+    n_start: float = Field(gt=0, description="起始介质折射率，必须为正")
+    interfaces: list[InterfaceIn] = Field(default_factory=list)
+    observation_line: ObservationLineIn
+    perturbation_angle_deg: float = Field(
+        gt=0, description="法线扰动角（度），必须为正；对每个界面分别旋转 ±该角度"
+    )
+
+    @field_validator("direction")
+    @classmethod
+    def direction_nonzero(cls, v: Vec2) -> Vec2:
+        if math.hypot(v.x, v.y) < _EPS:
+            raise ValueError("方向不能为零向量")
+        return v
+
+
+class SensitivityRunOut(BaseModel):
+    """一次追迹（基准或单侧扰动）的状态与观察线偏移结果。"""
+
+    status: str
+    reason: str | None
+    observation_point: Vec2 | None
+    offset: float | None
+
+
+class SensitivityPerturbationOut(SensitivityRunOut):
+    """单侧法线扰动结果：附本次扰动后的单位法线与扰动角（度，逆时针为正）。"""
+
+    perturbed_normal: Vec2
+    perturbation_angle_deg: float
+
+
+class InterfaceSensitivityOut(BaseModel):
+    """单个界面的两次法线扰动结果与中心差分导数（长度/度）。"""
+
+    interface_index: int
+    plus: SensitivityPerturbationOut
+    minus: SensitivityPerturbationOut
+    derivative_per_deg: float | None
+
+
+class AlignmentSensitivityOut(BaseModel):
+    tangent: Vec2
+    perturbation_angle_deg: float
+    baseline: SensitivityRunOut
+    interfaces: list[InterfaceSensitivityOut]
